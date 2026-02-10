@@ -1,0 +1,14 @@
+.{
+    .name = .docforge,
+    .version = "0.1.0",
+    .fingerprint = 0xf73b81e1c8a99601,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+        ".gitignore",
+    },
+}

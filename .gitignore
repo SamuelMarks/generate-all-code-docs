@@ -1,0 +1,6 @@
+.docforge/
+.zig-global-cache/
+.zig-cache/
+site/
+zig-cache/
+zig-out/
