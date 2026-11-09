@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: "0.17.1"
+      - name: Cache Zig build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/zig
+            zig-cache
+            .zig-cache
+            zig-out
+          key: zig-${{ runner.os }}-0.17.1-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**') }}
+          restore-keys: |
+            zig-${{ runner.os }}-0.17.1-
+      - name: Lint
+        run: |
+          zig fmt --check .
+          python3 scripts/coverage.py --no-update-readme --require-100
+      - name: Build
+        run: zig build
+      - name: Test
+        run: zig build test

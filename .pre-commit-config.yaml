@@ -1,0 +1,45 @@
+repos:
+  - repo: local
+    hooks:
+      - id: format
+        name: Check code formatting (auto-format and recheck)
+        entry: bash -c 'zig fmt . && zig fmt --check .'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+      - id: lint
+        name: Lint
+        entry: bash -c 'for f in build.zig build.zig.zon src/*.zig; do zig ast-check "$f"; done && python3 scripts/coverage.py --self-test && python3 scripts/coverage.py --no-update-readme --require-100'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+      - id: build
+        name: Build
+        entry: zig build
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+      - id: test
+        name: Test
+        entry: zig build test
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+      - id: doc-coverage-shield
+        name: Add/update '% doc coverage' shield in README.md
+        entry: python3 scripts/coverage.py --doc-only --require-100
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+      - id: test-coverage-shield
+        name: Add/update '% test coverage' shield in README.md
+        entry: python3 scripts/coverage.py --test-only --require-100
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]

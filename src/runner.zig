@@ -1,18 +1,21 @@
+//! External subprocess execution, output capture, verbose logging, and thread-safe test mocking.
+
 const std = @import("std");
 const types = @import("types.zig");
+const fsutils = @import("fsutils.zig");
 
 /// Runner options for external commands.
 pub const RunOptions = struct {
     /// Enable verbose logging.
     verbose: bool = false,
     /// Optional log file for command output.
-    log_file: ?std.fs.File = null,
+    log_file: ?std.Io.File = null,
     /// Emit JSON logs for command invocations.
     json: bool = false,
     /// Skip SSL verification for git and curl.
     insecure: bool = false,
-    /// Optional mutex to serialize log output.
-    log_mutex: ?*std.Thread.Mutex = null,
+    /// Optional mutex to serialize log output across worker threads.
+    log_mutex: ?*std.Io.Mutex = null,
 };
 
 /// Captured command output.
@@ -27,63 +30,102 @@ pub const RunResult = struct {
     allocator: types.Allocator,
 
     /// Release captured output buffers.
+    ///
+    /// @param self Pointer to the `RunResult` to deinitialize.
     pub fn deinit(self: *RunResult) void {
         self.allocator.free(self.stdout);
         self.allocator.free(self.stderr);
     }
 };
 
-/// Test runner callback signature.
+/// Test runner callback signature with a concrete error set (`types.GenerateAllCodeDocsError`).
 pub const TestRunner = struct {
-    /// Function invoked instead of the real runner during tests.
-    run: *const fn (types.Allocator, []const []const u8, ?[]const u8, RunOptions) anyerror!RunResult,
+    /// Function invoked instead of spawning an OS process during tests.
+    run: *const fn (types.Allocator, []const []const u8, ?[]const u8, RunOptions) types.GenerateAllCodeDocsError!RunResult,
 };
 
+/// Global test runner override protected by `test_runner_mutex`.
 var test_runner: ?TestRunner = null;
-var test_called: bool = false;
+/// Mutex protecting access to `test_runner` across parallel worker threads.
+var test_runner_mutex: std.Io.Mutex = .init;
 
-/// Install a test runner implementation.
+/// Install or clear a test runner implementation in a thread-safe manner.
+///
+/// @param runner Optional `TestRunner` callback to install, or `null` to restore real process execution.
 pub fn setTestRunner(runner: ?TestRunner) void {
+    const io = fsutils.defaultIo();
+    test_runner_mutex.lockUncancelable(io);
+    defer test_runner_mutex.unlock(io);
     test_runner = runner;
 }
 
-/// Run a command and capture its output.
-pub fn run(allocator: types.Allocator, argv: []const []const u8, cwd: ?[]const u8, options: RunOptions) !RunResult {
+/// Read the currently installed `TestRunner` under lock.
+///
+/// @return Active `TestRunner` if installed.
+fn getTestRunner() ?TestRunner {
+    const io = fsutils.defaultIo();
+    test_runner_mutex.lockUncancelable(io);
+    defer test_runner_mutex.unlock(io);
+    return test_runner;
+}
+
+/// Structured JSON payload for verbose command logging.
+const CommandLog = struct {
+    /// Event discriminator (`"command"`).
+    event: []const u8,
+    /// Command argument vector executed.
+    argv: []const []const u8,
+};
+
+/// Run an external command and capture its standard output and error streams.
+///
+/// @param allocator Allocator for capturing stdout/stderr buffers.
+/// @param argv Command argument slice (`argv[0]` is executable).
+/// @param cwd Optional working directory path for the child process.
+/// @param options Execution and logging options.
+/// @return Captured `RunResult` owned by caller.
+pub fn run(
+    allocator: types.Allocator,
+    argv: []const []const u8,
+    cwd: ?[]const u8,
+    options: RunOptions,
+) types.GenerateAllCodeDocsError!RunResult {
+    const io = fsutils.defaultIo();
     if (options.verbose) {
         if (options.log_file) |file| {
             const maybe_mutex = options.log_mutex;
-            if (maybe_mutex) |mutex| mutex.lock();
-            defer if (maybe_mutex) |mutex| mutex.unlock();
+            if (maybe_mutex) |mutex| mutex.lockUncancelable(io);
+            defer if (maybe_mutex) |mutex| mutex.unlock(io);
 
             var buffer: [1024]u8 = undefined;
-            var writer = file.writer(&buffer);
+            var writer = file.writerStreaming(io, &buffer);
             if (options.json) {
                 const log = CommandLog{ .event = "command", .argv = argv };
                 try std.json.Stringify.value(log, .{}, &writer.interface);
-                try writer.interface.writeAll("\n");
+                try writer.interface.writeAll("\x0a");
             } else {
                 try writer.interface.writeAll("run:");
                 for (argv) |arg| {
                     try writer.interface.writeAll(" ");
                     try writer.interface.writeAll(arg);
                 }
-                try writer.interface.writeAll("\n");
+                try writer.interface.writeAll("\x0a");
             }
             try writer.interface.flush();
         }
     }
 
     if (@import("builtin").is_test) {
-        if (test_runner) |runner| {
-            return runner.run(allocator, argv, cwd, options);
+        if (getTestRunner()) |installed| {
+            return installed.run(allocator, argv, cwd, options);
         }
     }
 
-    const result = try std.process.Child.run(.{
-        .allocator = allocator,
+    const result = try std.process.run(allocator, io, .{
         .argv = argv,
-        .cwd = cwd,
-        .max_output_bytes = 10 * 1024 * 1024,
+        .cwd = if (cwd) |dir| .{ .path = dir } else .inherit,
+        .stdout_limit = .limited(10 * 1024 * 1024),
+        .stderr_limit = .limited(10 * 1024 * 1024),
     });
 
     return RunResult{
@@ -94,83 +136,118 @@ pub fn run(allocator: types.Allocator, argv: []const []const u8, cwd: ?[]const u
     };
 }
 
-const CommandLog = struct {
-    event: []const u8,
+/// Run an external command and require exit code 0, freeing buffers and returning `error.CommandFailed` otherwise.
+///
+/// @param allocator Allocator for capturing stdout/stderr buffers.
+/// @param argv Command argument slice.
+/// @param cwd Optional working directory path.
+/// @param options Execution and logging options.
+/// @return Captured `RunResult` when exit status is 0.
+pub fn runChecked(
+    allocator: types.Allocator,
     argv: []const []const u8,
-};
-
-/// Run a command and require a successful exit code.
-pub fn runChecked(allocator: types.Allocator, argv: []const []const u8, cwd: ?[]const u8, options: RunOptions) !RunResult {
+    cwd: ?[]const u8,
+    options: RunOptions,
+) types.GenerateAllCodeDocsError!RunResult {
     var result = try run(allocator, argv, cwd, options);
-    if (result.term != .Exited or result.term.Exited != 0) {
+    if (result.term != .exited or result.term.exited != 0) {
         result.deinit();
         return error.CommandFailed;
     }
     return result;
 }
 
-test "runner uses test runner" {
-    // covers: runner.setTestRunner runner.run runner.deinit
+test "runner uses test runner and real process when test runner is null" {
+    // covers: runner.setTestRunner runner.getTestRunner runner.run runner.deinit
     const allocator = std.testing.allocator;
-    test_called = false;
 
     const fake = TestRunner{ .run = struct {
-        fn run(alloc: types.Allocator, argv: []const []const u8, _: ?[]const u8, _: RunOptions) anyerror!RunResult {
-            _ = argv;
-            test_called = true;
-            const out = try alloc.alloc(u8, 0);
-            return RunResult{ .stdout = out, .stderr = out, .term = .{ .Exited = 0 }, .allocator = alloc };
+        fn runFn(alloc: types.Allocator, argv: []const []const u8, _: ?[]const u8, _: RunOptions) types.GenerateAllCodeDocsError!RunResult {
+            const out = try alloc.dupe(u8, argv[0]);
+            const err = try alloc.alloc(u8, 0);
+            return RunResult{ .stdout = out, .stderr = err, .term = .{ .exited = 0 }, .allocator = alloc };
         }
-    }.run };
+    }.runFn };
 
     setTestRunner(fake);
     defer setTestRunner(null);
 
     var result = try run(allocator, &.{"echo"}, null, .{});
     defer result.deinit();
-    try std.testing.expect(test_called);
+    try std.testing.expectEqualStrings("echo", result.stdout);
 }
 
-test "runner emits json log when enabled" {
+test "runner emits json and text verbose logs with mutex locking" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var file = try tmp.dir.createFile("log.json", .{ .truncate = true, .read = true });
-    defer file.close();
+    var json_file = try tmp.dir.createFile(std.testing.io, "log.json", .{ .truncate = true, .read = true });
+    defer json_file.close(std.testing.io);
+
+    var text_file = try tmp.dir.createFile(std.testing.io, "log.txt", .{ .truncate = true, .read = true });
+    defer text_file.close(std.testing.io);
 
     const fake = TestRunner{ .run = struct {
-        fn run(alloc: types.Allocator, _: []const []const u8, _: ?[]const u8, _: RunOptions) anyerror!RunResult {
+        fn runFn(alloc: types.Allocator, _: []const []const u8, _: ?[]const u8, _: RunOptions) types.GenerateAllCodeDocsError!RunResult {
             const out = try alloc.alloc(u8, 0);
-            return RunResult{ .stdout = out, .stderr = out, .term = .{ .Exited = 0 }, .allocator = alloc };
+            const err = try alloc.alloc(u8, 0);
+            return RunResult{ .stdout = out, .stderr = err, .term = .{ .exited = 0 }, .allocator = alloc };
         }
-    }.run };
+    }.runFn };
     setTestRunner(fake);
     defer setTestRunner(null);
 
-    var result = try run(std.testing.allocator, &.{ "git", "status" }, null, .{
+    var mutex = std.Io.Mutex.init;
+
+    var json_res = try run(std.testing.allocator, &.{ "git", "status" }, null, .{
         .verbose = true,
         .json = true,
-        .log_file = file,
+        .log_file = json_file,
+        .log_mutex = &mutex,
     });
-    defer result.deinit();
+    defer json_res.deinit();
 
-    const data = try tmp.dir.readFileAlloc(std.testing.allocator, "log.json", 4096);
-    defer std.testing.allocator.free(data);
-    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "\"event\":\"command\""));
-    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "\"argv\""));
+    var text_res = try run(std.testing.allocator, &.{ "git", "status" }, null, .{
+        .verbose = true,
+        .json = false,
+        .log_file = text_file,
+        .log_mutex = &mutex,
+    });
+    defer text_res.deinit();
+
+    const json_data = try tmp.dir.readFileAlloc(std.testing.io, "log.json", std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(json_data);
+    try std.testing.expect(std.mem.containsAtLeast(u8, json_data, 1, "\x22event\x22:\x22command\x22"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, json_data, 1, "\x22argv\x22:[\x22git\x22,\x22status\x22]"));
+
+    const text_data = try tmp.dir.readFileAlloc(std.testing.io, "log.txt", std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(text_data);
+    try std.testing.expectEqualStrings("run: git status\x0a", text_data);
 }
 
-test "runChecked returns error on non-zero exit" {
+test "runChecked returns error on non-zero exit or signal termination" {
     // covers: runner.runChecked
-    const fake = TestRunner{ .run = struct {
-        fn run(alloc: types.Allocator, _: []const []const u8, _: ?[]const u8, _: RunOptions) anyerror!RunResult {
+    const fake_exit = TestRunner{ .run = struct {
+        fn runFn(alloc: types.Allocator, _: []const []const u8, _: ?[]const u8, _: RunOptions) types.GenerateAllCodeDocsError!RunResult {
             const out = try alloc.alloc(u8, 0);
-            return RunResult{ .stdout = out, .stderr = out, .term = .{ .Exited = 1 }, .allocator = alloc };
+            const err = try alloc.alloc(u8, 0);
+            return RunResult{ .stdout = out, .stderr = err, .term = .{ .exited = 1 }, .allocator = alloc };
         }
-    }.run };
+    }.runFn };
 
-    setTestRunner(fake);
+    setTestRunner(fake_exit);
     defer setTestRunner(null);
 
-    try std.testing.expectError(error.CommandFailed, runChecked(std.testing.allocator, &.{ "false" }, null, .{}));
+    try std.testing.expectError(error.CommandFailed, runChecked(std.testing.allocator, &.{"false"}, null, .{}));
+
+    const fake_sig = TestRunner{ .run = struct {
+        fn runFn(alloc: types.Allocator, _: []const []const u8, _: ?[]const u8, _: RunOptions) types.GenerateAllCodeDocsError!RunResult {
+            const out = try alloc.alloc(u8, 0);
+            const err = try alloc.alloc(u8, 0);
+            return RunResult{ .stdout = out, .stderr = err, .term = .{ .signal = .KILL }, .allocator = alloc };
+        }
+    }.runFn };
+
+    setTestRunner(fake_sig);
+    try std.testing.expectError(error.CommandFailed, runChecked(std.testing.allocator, &.{"kill"}, null, .{}));
 }

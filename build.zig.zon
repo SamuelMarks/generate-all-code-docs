@@ -1,8 +1,8 @@
 .{
-    .name = .docforge,
+    .name = .generate_all_code_docs,
     .version = "0.1.0",
-    .fingerprint = 0xf73b81e1c8a99601,
-    .minimum_zig_version = "0.15.2",
+    .fingerprint = 0x5c06cbffadebcb84,
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{},
     .paths = .{
         "build.zig",

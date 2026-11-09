@@ -1,8 +1,9 @@
-# docforge
-<!-- coverage-badges:start -->
+generate-all-code-docs
+======================
+
 ![Doc Coverage](https://img.shields.io/badge/doc%20coverage-100%25-brightgreen)
 ![Test Coverage](https://img.shields.io/badge/test%20coverage-100%25-brightgreen)
-<!-- coverage-badges:end -->
+[![CI](https://github.com/SamuelMarks/generate-all-code-docs/actions/workflows/ci.yml/badge.svg)](https://github.com/SamuelMarks/generate-all-code-docs/actions/workflows/ci.yml)
 
 Generate static API docs for many repositories and publish them under a single GitHub Pages path.
 
@@ -17,7 +18,7 @@ Generate static API docs for many repositories and publish them under a single G
 - Designed to run on Windows, Linux, and macOS
 
 ## Requirements
-- Zig (0.11+ recommended)
+- Zig (0.17+ recommended)
 - Git installed and on PATH
 - One or more doc generators (mkdocs, sphinx, doxygen, go, cargo)
 - For archive URLs: curl + tar/unzip on macOS/Linux, PowerShell + tar/Expand-Archive on Windows
@@ -27,22 +28,22 @@ Generate static API docs for many repositories and publish them under a single G
 ```
 zig build run -- init --username yourname --path docs --output-dir site
 ```
-2) Edit `docforge.json` to add repos.
+2) Edit `generate-all-code-docs.json` to add repos.
 3) Generate docs:
 ```
-zig build run -- run --config docforge.json
+zig build run -- run --config generate-all-code-docs.json
 ```
 Use `--no-incremental` to force rebuilding all docs.
 
 4) Deploy to GitHub Pages:
 ```
-zig build run -- deploy --config docforge.json
+zig build run -- deploy --config generate-all-code-docs.json
 ```
 
 ## Repo discovery
 Generate a config by scanning a root folder for git repos:
 ```
-zig build run -- discover --root /path/to/repos --config docforge.json
+zig build run -- discover --root /path/to/repos --config generate-all-code-docs.json
 ```
 
 Options:
@@ -55,7 +56,7 @@ Options:
 Common commands:
 - `run` generates docs from the config
 - `list` prints configured repos, detected tools, and last commit (from manifests)
-- `clean` removes `.docforge/cache`, `.docforge/work`, and the site output path
+- `clean` removes `.generate-all-code-docs/cache`, `.generate-all-code-docs/work`, and the site output path
 - `deploy` publishes to GitHub Pages
 
 Useful flags:
@@ -63,7 +64,7 @@ Useful flags:
 - `--insecure` skips SSL verification for git and curl
 - `--preserve-history` keeps existing `gh-pages` content and adds new commits on top
 
-## Config format (docforge.json)
+## Config format (generate-all-code-docs.json)
 ```
 {
   "site": {
@@ -78,8 +79,8 @@ Useful flags:
     "cargo": { "argv": ["cargo", "doc", "--no-deps", "--target-dir", "{output_dir}"] }
   },
   "index_template": "index-template.html",
-  "cache_dir": ".docforge/cache",
-  "work_dir": ".docforge/work",
+  "cache_dir": ".generate-all-code-docs/cache",
+  "work_dir": ".generate-all-code-docs/work",
   "repos": [
     {
       "name": "repo-name",
@@ -163,7 +164,7 @@ Changing a tool template forces a rebuild for repos that use that tool.
 ## Deploy
 Publish the generated site to the `gh-pages` branch of the current repo:
 ```
-zig build run -- deploy --config docforge.json
+zig build run -- deploy --config generate-all-code-docs.json
 ```
 Use `--remote`, `--branch`, and `--message` to customize the target. Add `--preserve-history` to keep existing `gh-pages` content and append new commits.
 
@@ -176,5 +177,5 @@ zig build test
 Project policy: 100% doc coverage for public APIs and 100% test coverage for core logic.
 
 ## Notes
-- Worktrees are created under `.docforge/work` and are safe to delete.
-- Cached clones and downloads live under `.docforge/cache`.
+- Worktrees are created under `.generate-all-code-docs/work` and are safe to delete.
+- Cached clones and downloads live under `.generate-all-code-docs/cache`.

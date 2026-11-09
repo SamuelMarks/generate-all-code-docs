@@ -1,4 +1,4 @@
-.docforge/
+.generate-all-code-docs/
 .zig-global-cache/
 .zig-cache/
 site/

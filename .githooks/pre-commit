@@ -3,4 +3,12 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+if command -v pre-commit >/dev/null 2>&1 && [ -f "$ROOT/.pre-commit-config.yaml" ]; then
+  pre-commit run --all-files
+  git add "$ROOT/README.md"
+  exit 0
+fi
+
 "$ROOT/scripts/coverage.sh"
+git add "$ROOT/README.md"
+

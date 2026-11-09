@@ -1,15 +1,18 @@
+//! Loading, environment variable expansion, validation, and JSON serialization of `generate-all-code-docs.json`.
+
 const std = @import("std");
 const types = @import("types.zig");
 const paths = @import("paths.zig");
+const fsutils = @import("fsutils.zig");
 
-/// Top-level configuration loaded from docforge.json.
+/// Top-level configuration loaded from `generate-all-code-docs.json`.
 pub const Config = struct {
     /// GitHub Pages settings for output layout.
     site: Site,
     /// Cache directory for cloned repositories and downloads.
-    cache_dir: []const u8 = ".docforge/cache",
+    cache_dir: []const u8 = ".generate-all-code-docs/cache",
     /// Work directory for extracted archives and worktrees.
-    work_dir: []const u8 = ".docforge/work",
+    work_dir: []const u8 = ".generate-all-code-docs/work",
     /// Optional per-tool command templates.
     tool_templates: ?types.ToolTemplates = null,
     /// Optional HTML template path for the global index.
@@ -22,7 +25,7 @@ pub const Config = struct {
 pub const Site = struct {
     /// GitHub username (used for metadata only).
     username: []const u8,
-    /// Path segment under username.github.io.
+    /// Path segment under `username.github.io`.
     path: []const u8,
     /// Output directory root for generated docs.
     output_dir: []const u8,
@@ -44,7 +47,7 @@ pub const Repo = struct {
     output_subpath: ?[]const u8 = null,
     /// Optional include glob to filter repo contents.
     include: ?[]const u8 = null,
-    /// Optional exclude glob to filter repo contents.
+    /// Optional exclude glob to skip files and directories.
     exclude: ?[]const u8 = null,
     /// Optional command argv to run when using the shell tool.
     argv: ?types.Command = null,
@@ -64,14 +67,33 @@ pub const ParsedConfig = struct {
     value: Config,
 
     /// Release the arena memory.
+    ///
+    /// @param self Pointer to the `ParsedConfig` instance to deinitialize.
     pub fn deinit(self: *ParsedConfig) void {
         self.parsed.deinit();
     }
 };
 
-/// Load and parse the configuration from JSON.
-pub fn load(allocator: types.Allocator, path: []const u8) !ParsedConfig {
-    const data = try std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024);
+/// Errors returned while expanding or validating configs.
+pub const ConfigError = error{
+    /// A referenced `${VAR}` environment variable was missing or empty.
+    MissingEnvVar,
+    /// A `${VAR` placeholder in a source string lacked a closing `}`.
+    UnterminatedEnvVar,
+    /// Two or more repositories resolved to the same output subpath.
+    DuplicateOutputSubpath,
+    /// A repository output subpath collided with the site root or attempted `..` traversal.
+    OutputPathCollision,
+};
+
+/// Load, expand environment variables, and validate a configuration from a JSON file.
+///
+/// @param allocator Backing allocator for reading the file and initializing the JSON arena.
+/// @param path Filesystem path to the configuration JSON file.
+/// @return Validated `ParsedConfig` owned by caller.
+pub fn load(allocator: types.Allocator, path: []const u8) types.GenerateAllCodeDocsError!ParsedConfig {
+    const io = fsutils.defaultIo();
+    const data = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
     defer allocator.free(data);
 
     const parsed = try std.json.parseFromSlice(Config, allocator, data, .{
@@ -86,21 +108,39 @@ pub fn load(allocator: types.Allocator, path: []const u8) !ParsedConfig {
     return ParsedConfig{ .parsed = parsed, .value = cfg };
 }
 
-/// Errors returned while expanding or validating configs.
-pub const ConfigError = error{
-    MissingEnvVar,
-    UnterminatedEnvVar,
-    DuplicateOutputSubpath,
-    OutputPathCollision,
-};
-
-fn expandEnvVars(allocator: types.Allocator, cfg: *Config) !void {
+/// Expand `${VAR}` placeholders in all `cfg.repos[i].source` strings in place.
+///
+/// @param allocator Arena allocator for expanded source strings.
+/// @param cfg Mutable pointer to the `Config` being loaded.
+fn expandEnvVars(allocator: types.Allocator, cfg: *Config) (std.mem.Allocator.Error || ConfigError)!void {
     for (cfg.repos) |*repo| {
         repo.source = try expandEnvVar(allocator, repo.source);
     }
 }
 
-fn expandEnvVar(allocator: types.Allocator, input: []const u8) ![]const u8 {
+/// Look up an environment variable by name and return an owned copy of its value.
+///
+/// @param allocator Allocator for the variable value copy.
+/// @param name Environment variable name (must be non-empty).
+/// @return Owned slice containing the environment variable value, or `ConfigError.MissingEnvVar`.
+fn getEnvVarOwned(allocator: types.Allocator, name: []const u8) (std.mem.Allocator.Error || ConfigError)![]u8 {
+    if (name.len == 0) return ConfigError.MissingEnvVar;
+    const environ = if (@import("builtin").is_test)
+        std.testing.environ
+    else
+        std.Options.debug_threaded_io.?.environ.process_environ;
+    return environ.getAlloc(allocator, name) catch |err| switch (err) {
+        error.EnvironmentVariableMissing, error.InvalidWtf8 => return ConfigError.MissingEnvVar,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+}
+
+/// Expand all `${VAR}` tokens in `input` using process environment variables.
+///
+/// @param allocator Allocator for the expanded string.
+/// @param input Source string potentially containing `${VAR}` tokens.
+/// @return Newly allocated string with all environment variables expanded.
+fn expandEnvVar(allocator: types.Allocator, input: []const u8) (std.mem.Allocator.Error || ConfigError)![]const u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
 
@@ -110,10 +150,7 @@ fn expandEnvVar(allocator: types.Allocator, input: []const u8) ![]const u8 {
             const start = i + 2;
             const end = std.mem.indexOfScalarPos(u8, input, start, '}') orelse return ConfigError.UnterminatedEnvVar;
             const name = input[start..end];
-            const value = std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
-                error.EnvironmentVariableNotFound => return ConfigError.MissingEnvVar,
-                else => return err,
-            };
+            const value = try getEnvVarOwned(allocator, name);
             defer allocator.free(value);
             try out.appendSlice(allocator, value);
             i = end + 1;
@@ -126,7 +163,11 @@ fn expandEnvVar(allocator: types.Allocator, input: []const u8) ![]const u8 {
     return out.toOwnedSlice(allocator);
 }
 
-fn validateConfig(allocator: types.Allocator, cfg: Config) !void {
+/// Validate that no two repositories resolve to the same normalized output subpath and none collide with the site root.
+///
+/// @param allocator Backing allocator for temporary validation structures.
+/// @param cfg Configuration to validate.
+fn validateConfig(allocator: types.Allocator, cfg: Config) (std.mem.Allocator.Error || ConfigError)!void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const work = arena.allocator();
@@ -134,12 +175,10 @@ fn validateConfig(allocator: types.Allocator, cfg: Config) !void {
     var seen = std.StringHashMap(void).init(work);
     defer seen.deinit();
 
-    const site_root = try std.fs.path.join(work, &.{ cfg.site.output_dir, cfg.site.path });
-
     for (cfg.repos) |repo| {
         const name = repo.name orelse try paths.baseNameFromSource(work, repo.source);
         const raw_subpath = repo.output_subpath orelse name;
-        const normalized = try normalizeSubpath(work, raw_subpath);
+        const normalized = try paths.normalizeSubpath(work, raw_subpath);
 
         if (normalized.len == 0) {
             return ConfigError.OutputPathCollision;
@@ -149,276 +188,223 @@ fn validateConfig(allocator: types.Allocator, cfg: Config) !void {
             return ConfigError.DuplicateOutputSubpath;
         }
         try seen.put(normalized, {});
-
-        const repo_root = try std.fs.path.join(work, &.{ cfg.site.output_dir, cfg.site.path, normalized });
-        if (std.mem.eql(u8, site_root, repo_root)) {
-            return ConfigError.OutputPathCollision;
-        }
     }
 }
 
-fn normalizeSubpath(allocator: types.Allocator, input: []const u8) ![]const u8 {
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
+/// Write a starter configuration file to disk using structured JSON serialization (preventing JSON injection).
+/// Fails if `path` already exists (`exclusive = true`).
+///
+/// @param path Destination configuration file path.
+/// @param username GitHub Pages username.
+/// @param site_path GitHub Pages site path segment.
+/// @param output_dir Output directory root.
+pub fn writeTemplate(
+    path: []const u8,
+    username: []const u8,
+    site_path: []const u8,
+    output_dir: []const u8,
+) (std.Io.File.OpenError || std.Io.File.Writer.Error || std.Io.Writer.Error)!void {
+    const io = fsutils.defaultIo();
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true });
+    defer file.close(io);
 
-    var i: usize = 0;
-    while (i + 1 < input.len and input[i] == '.' and (input[i + 1] == '/' or input[i + 1] == '\\')) {
-        i += 2;
-    }
+    var example_repos = [_]Repo{.{
+        .name = "example",
+        .source = "../path/to/repo",
+        .ref = .{ .kind = .tag, .value = "v1.0.0" },
+        .doc_tool = .mkdocs,
+    }};
+    const template_cfg = Config{
+        .site = .{
+            .username = username,
+            .path = site_path,
+            .output_dir = output_dir,
+        },
+        .repos = example_repos[0..],
+    };
 
-    while (i < input.len) : (i += 1) {
-        const ch = if (input[i] == '\\') '/' else input[i];
-        try out.append(allocator, ch);
-    }
-
-    while (out.items.len > 0 and out.items[out.items.len - 1] == '/') {
-        out.items.len -= 1;
-    }
-
-    if (out.items.len == 1 and out.items[0] == '.') {
-        out.items.len = 0;
-    }
-
-    return out.toOwnedSlice(allocator);
-}
-
-/// Write a starter configuration file to disk.
-pub fn writeTemplate(path: []const u8, username: []const u8, site_path: []const u8, output_dir: []const u8) !void {
-    var file = try std.fs.cwd().createFile(path, .{ .exclusive = true });
-    defer file.close();
-    var buffer: [512]u8 = undefined;
-    var writer = file.writer(&buffer);
-    try writer.interface.print(
-        "{{\n" ++
-            "  \"site\": {{\n" ++
-            "    \"username\": \"{s}\",\n" ++
-            "    \"path\": \"{s}\",\n" ++
-            "    \"output_dir\": \"{s}\"\n" ++
-            "  }},\n" ++
-            "  \"repos\": [\n" ++
-            "    {{\n" ++
-            "      \"name\": \"example\",\n" ++
-            "      \"source\": \"../path/to/repo\",\n" ++
-            "      \"ref\": {{ \"kind\": \"tag\", \"value\": \"v1.0.0\" }},\n" ++
-            "      \"doc_tool\": \"mkdocs\"\n" ++
-            "    }}\n" ++
-            "  ]\n" ++
-            "}}\n",
-        .{ username, site_path, output_dir },
-    );
+    var buffer: [1024]u8 = undefined;
+    var writer = file.writerStreaming(io, &buffer);
+    try std.json.Stringify.value(template_cfg, .{ .whitespace = .indent_2, .emit_null_optional_fields = false }, &writer.interface);
+    try writer.interface.writeAll("\x0a");
     try writer.interface.flush();
 }
 
-/// Write a configuration file to disk as JSON.
-pub fn write(path: []const u8, cfg: Config) !void {
-    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-    defer file.close();
+/// Write a `Config` struct to disk as pretty-printed JSON.
+///
+/// @param path Destination configuration file path.
+/// @param cfg Configuration structure to serialize.
+pub fn write(path: []const u8, cfg: Config) (std.Io.File.OpenError || std.Io.File.Writer.Error || std.Io.Writer.Error)!void {
+    const io = fsutils.defaultIo();
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer file.close(io);
 
     var buffer: [2048]u8 = undefined;
-    var writer = file.writer(&buffer);
+    var writer = file.writerStreaming(io, &buffer);
     try std.json.Stringify.value(cfg, .{ .whitespace = .indent_2, .emit_null_optional_fields = false }, &writer.interface);
-    try writer.interface.writeAll("\n");
+    try writer.interface.writeAll("\x0a");
     try writer.interface.flush();
 }
 
-test "config loads defaults" {
+test "config loads defaults and tool templates and hooks" {
     const allocator = std.testing.allocator;
     const json =
-        "{\n" ++
-        "  \"site\": {\n" ++
-        "    \"username\": \"sam\",\n" ++
-        "    \"path\": \"docs\",\n" ++
-        "    \"output_dir\": \"site\"\n" ++
-        "  },\n" ++
-        "  \"repos\": [\n" ++
-        "    {\n" ++
-        "      \"source\": \"../repo\"\n" ++
-        "    }\n" ++
-        "  ]\n" ++
-        "}\n";
+        "{\x0a" ++
+        "  \x22site\x22: {\x0a" ++
+        "    \x22username\x22: \x22sam\x22,\x0a" ++
+        "    \x22path\x22: \x22docs\x22,\x0a" ++
+        "    \x22output_dir\x22: \x22site\x22\x0a" ++
+        "  },\x0a" ++
+        "  \x22tool_templates\x22: {\x0a" ++
+        "    \x22mkdocs\x22: {\x0a" ++
+        "      \x22argv\x22: [\x22mkdocs\x22, \x22build\x22, \x22-d\x22, \x22{output_dir}\x22]\x0a" ++
+        "    }\x0a" ++
+        "  },\x0a" ++
+        "  \x22repos\x22: [\x0a" ++
+        "    {\x0a" ++
+        "      \x22source\x22: \x22../repo\x22,\x0a" ++
+        "      \x22doc_tool\x22: \x22shell\x22,\x0a" ++
+        "      \x22argv\x22: [\x22echo\x22, \x22hi\x22],\x0a" ++
+        "      \x22pre_build\x22: [[\x22npm\x22, \x22install\x22]],\x0a" ++
+        "      \x22post_build\x22: [[\x22npm\x22, \x22run\x22, \x22build\x22]]\x0a" ++
+        "    }\x0a" ++
+        "  ]\x0a" ++
+        "}\x0a";
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
     const parsed = try std.json.parseFromSlice(Config, arena.allocator(), json, .{});
-    try std.testing.expectEqualStrings(".docforge/cache", parsed.value.cache_dir);
-    try std.testing.expectEqualStrings(".docforge/work", parsed.value.work_dir);
-    try std.testing.expect(parsed.value.tool_templates == null);
-    try std.testing.expectEqual(@as(usize, 1), parsed.value.repos.len);
-}
-
-test "config parses tool templates" {
-    const allocator = std.testing.allocator;
-    const json =
-        "{\n" ++
-        "  \"site\": {\n" ++
-        "    \"username\": \"sam\",\n" ++
-        "    \"path\": \"docs\",\n" ++
-        "    \"output_dir\": \"site\"\n" ++
-        "  },\n" ++
-        "  \"tool_templates\": {\n" ++
-        "    \"mkdocs\": {\n" ++
-        "      \"argv\": [\"mkdocs\", \"build\", \"-d\", \"{output_dir}\"]\n" ++
-        "    }\n" ++
-        "  },\n" ++
-        "  \"repos\": [\n" ++
-        "    {\n" ++
-        "      \"source\": \"../repo\"\n" ++
-        "    }\n" ++
-        "  ]\n" ++
-        "}\n";
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
-    const parsed = try std.json.parseFromSlice(Config, arena.allocator(), json, .{});
+    try std.testing.expectEqualStrings(".generate-all-code-docs/cache", parsed.value.cache_dir);
+    try std.testing.expectEqualStrings(".generate-all-code-docs/work", parsed.value.work_dir);
     try std.testing.expect(parsed.value.tool_templates != null);
-    const mkdocs = parsed.value.tool_templates.?.mkdocs orelse {
-        try std.testing.expect(false);
-        return;
-    };
-    try std.testing.expectEqualStrings("mkdocs", mkdocs.argv[0]);
-}
-
-test "config parses hooks and shell argv" {
-    const allocator = std.testing.allocator;
-    const json =
-        "{\n" ++
-        "  \"site\": {\n" ++
-        "    \"username\": \"sam\",\n" ++
-        "    \"path\": \"docs\",\n" ++
-        "    \"output_dir\": \"site\"\n" ++
-        "  },\n" ++
-        "  \"repos\": [\n" ++
-        "    {\n" ++
-        "      \"source\": \"../repo\",\n" ++
-        "      \"doc_tool\": \"shell\",\n" ++
-        "      \"argv\": [\"echo\", \"hi\"],\n" ++
-        "      \"pre_build\": [[\"npm\", \"install\"]],\n" ++
-        "      \"post_build\": [[\"npm\", \"run\", \"build\"]]\n" ++
-        "    }\n" ++
-        "  ]\n" ++
-        "}\n";
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const parsed = try std.json.parseFromSlice(Config, arena.allocator(), json, .{});
+    try std.testing.expectEqualStrings("mkdocs", parsed.value.tool_templates.?.mkdocs.?.argv[0]);
     try std.testing.expectEqual(types.DocTool.shell, parsed.value.repos[0].doc_tool.?);
     try std.testing.expectEqualStrings("echo", parsed.value.repos[0].argv.?[0]);
     try std.testing.expectEqualStrings("npm", parsed.value.repos[0].pre_build.?[0][0]);
     try std.testing.expectEqualStrings("npm", parsed.value.repos[0].post_build.?[0][0]);
 }
 
-test "config expands env vars" {
-    // covers: config.load config.deinit
+test "config expands env vars and rejects missing or unterminated env vars" {
+    // covers: config.load config.deinit config.expandEnvVars config.getEnvVarOwned config.expandEnvVar
     const allocator = std.testing.allocator;
-    const token = std.process.getEnvVarOwned(allocator, "HOME") catch return error.SkipZigTest;
+    const token = getEnvVarOwned(allocator, "HOME") catch return error.SkipZigTest;
     defer allocator.free(token);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(base);
-    const path = try std.fs.path.join(allocator, &.{ base, "config.json" });
+    const path = try std.Io.Dir.path.join(allocator, &.{ base, "config.json" });
     defer allocator.free(path);
 
     const json =
-        "{\n" ++
-        "  \"site\": {\n" ++
-        "    \"username\": \"sam\",\n" ++
-        "    \"path\": \"docs\",\n" ++
-        "    \"output_dir\": \"site\"\n" ++
-        "  },\n" ++
-        "  \"repos\": [\n" ++
-        "    { \"source\": \"https://example.com/${HOME}/repo.git\" }\n" ++
-        "  ]\n" ++
-        "}\n";
+        "{\x0a" ++
+        "  \x22site\x22: {\x0a" ++
+        "    \x22username\x22: \x22sam\x22,\x0a" ++
+        "    \x22path\x22: \x22docs\x22,\x0a" ++
+        "    \x22output_dir\x22: \x22site\x22\x0a" ++
+        "  },\x0a" ++
+        "  \x22repos\x22: [\x0a" ++
+        "    { \x22source\x22: \x22https://example.com/${HOME}/${HOME}/repo.git\x22 }\x0a" ++
+        "  ]\x0a" ++
+        "}\x0a";
 
-    try tmp.dir.writeFile(.{ .sub_path = "config.json", .data = json });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = json });
     var parsed = try load(allocator, path);
     defer parsed.deinit();
-    const expected = try std.fmt.allocPrint(allocator, "https://example.com/{s}/repo.git", .{token});
+    const expected = try std.fmt.allocPrint(allocator, "https://example.com/{s}/{s}/repo.git", .{ token, token });
     defer allocator.free(expected);
     try std.testing.expectEqualStrings(expected, parsed.value.repos[0].source);
+
+    try std.testing.expectError(ConfigError.UnterminatedEnvVar, expandEnvVar(allocator, "https://example.com/${UNTERMINATED"));
+    try std.testing.expectError(ConfigError.MissingEnvVar, expandEnvVar(allocator, "https://example.com/${}"));
+    try std.testing.expectError(ConfigError.MissingEnvVar, expandEnvVar(allocator, "https://example.com/${GENERATE_ALL_CODE_DOCS_DEFINITELY_MISSING_VAR_99999}"));
 }
 
-test "config validation rejects duplicate output subpaths" {
+test "config validation rejects duplicate output subpaths and collisions" {
+    // covers: config.validateConfig
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(base);
-    const path = try std.fs.path.join(allocator, &.{ base, "config.json" });
-    defer allocator.free(path);
-    const json =
-        "{\n" ++
-        "  \"site\": {\n" ++
-        "    \"username\": \"sam\",\n" ++
-        "    \"path\": \"docs\",\n" ++
-        "    \"output_dir\": \"site\"\n" ++
-        "  },\n" ++
-        "  \"repos\": [\n" ++
-        "    { \"source\": \"../repo1\", \"output_subpath\": \"same\" },\n" ++
-        "    { \"source\": \"../repo2\", \"output_subpath\": \"same\" }\n" ++
-        "  ]\n" ++
-        "}\n";
-    try tmp.dir.writeFile(.{ .sub_path = "config.json", .data = json });
+    const path = try std.Io.Dir.path.join(allocator, &.{ base, "config.json" });
+    defer std.testing.allocator.free(path);
+
+    const dup_json =
+        "{\x0a" ++
+        "  \x22site\x22: {\x0a" ++
+        "    \x22username\x22: \x22sam\x22,\x0a" ++
+        "    \x22path\x22: \x22docs\x22,\x0a" ++
+        "    \x22output_dir\x22: \x22site\x22\x0a" ++
+        "  },\x0a" ++
+        "  \x22repos\x22: [\x0a" ++
+        "    { \x22source\x22: \x22../repo1\x22, \x22output_subpath\x22: \x22same\x22 },\x0a" ++
+        "    { \x22source\x22: \x22../repo2\x22, \x22output_subpath\x22: \x22./same/\x22 }\x0a" ++
+        "  ]\x0a" ++
+        "}\x0a";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = dup_json });
     try std.testing.expectError(ConfigError.DuplicateOutputSubpath, load(allocator, path));
-}
 
-test "config validation rejects output path collision" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    const empty_json =
+        "{\x0a" ++
+        "  \x22site\x22: {\x0a" ++
+        "    \x22username\x22: \x22sam\x22,\x0a" ++
+        "    \x22path\x22: \x22docs\x22,\x0a" ++
+        "    \x22output_dir\x22: \x22site\x22\x0a" ++
+        "  },\x0a" ++
+        "  \x22repos\x22: [\x0a" ++
+        "    { \x22source\x22: \x22../repo1\x22, \x22output_subpath\x22: \x22.\x22 }\x0a" ++
+        "  ]\x0a" ++
+        "}\x0a";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = empty_json });
+    try std.testing.expectError(ConfigError.OutputPathCollision, load(allocator, path));
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(base);
-    const path = try std.fs.path.join(allocator, &.{ base, "config.json" });
-    defer allocator.free(path);
-    const json =
-        "{\n" ++
-        "  \"site\": {\n" ++
-        "    \"username\": \"sam\",\n" ++
-        "    \"path\": \"docs\",\n" ++
-        "    \"output_dir\": \"site\"\n" ++
-        "  },\n" ++
-        "  \"repos\": [\n" ++
-        "    { \"source\": \"../repo1\", \"output_subpath\": \"\" }\n" ++
-        "  ]\n" ++
-        "}\n";
-    try tmp.dir.writeFile(.{ .sub_path = "config.json", .data = json });
+    const traversal_json =
+        "{\x0a" ++
+        "  \x22site\x22: {\x0a" ++
+        "    \x22username\x22: \x22sam\x22,\x0a" ++
+        "    \x22path\x22: \x22docs\x22,\x0a" ++
+        "    \x22output_dir\x22: \x22site\x22\x0a" ++
+        "  },\x0a" ++
+        "  \x22repos\x22: [\x0a" ++
+        "    { \x22source\x22: \x22../repo1\x22, \x22output_subpath\x22: \x22../escape\x22 }\x0a" ++
+        "  ]\x0a" ++
+        "}\x0a";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = traversal_json });
     try std.testing.expectError(ConfigError.OutputPathCollision, load(allocator, path));
 }
 
-test "config writeTemplate renders starter config" {
+test "config writeTemplate safely escapes special JSON characters and loads back" {
     // covers: config.writeTemplate
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(base);
-    const path = try std.fs.path.join(std.testing.allocator, &.{ base, "template.json" });
+    const path = try std.Io.Dir.path.join(std.testing.allocator, &.{ base, "template.json" });
     defer std.testing.allocator.free(path);
 
-    try writeTemplate(path, "sam", "docs", "site");
+    try writeTemplate(path, "sam\x22quote", "docs\x5cslash", "site");
 
-    const data = try tmp.dir.readFileAlloc(std.testing.allocator, "template.json", 4096);
-    defer std.testing.allocator.free(data);
-    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "\"username\": \"sam\""));
-    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "\"path\": \"docs\""));
-    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "\"output_dir\": \"site\""));
+    var loaded = try load(std.testing.allocator, path);
+    defer loaded.deinit();
+    try std.testing.expectEqualStrings("sam\x22quote", loaded.value.site.username);
+    try std.testing.expectEqualStrings("docs\x5cslash", loaded.value.site.path);
+    try std.testing.expectEqualStrings("site", loaded.value.site.output_dir);
 }
 
-test "config write emits json" {
+test "config write emits valid json" {
     // covers: config.write
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(base);
-    const path = try std.fs.path.join(std.testing.allocator, &.{ base, "out.json" });
+    const path = try std.Io.Dir.path.join(std.testing.allocator, &.{ base, "out.json" });
     defer std.testing.allocator.free(path);
 
     var repos = [_]Repo{.{ .source = "../repo" }};
@@ -429,10 +415,8 @@ test "config write emits json" {
 
     try write(path, cfg);
 
-    const data = try tmp.dir.readFileAlloc(std.testing.allocator, "out.json", 4096);
-    defer std.testing.allocator.free(data);
-    const parsed = try std.json.parseFromSlice(Config, std.testing.allocator, data, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings("sam", parsed.value.site.username);
-    try std.testing.expectEqual(@as(usize, 1), parsed.value.repos.len);
+    var loaded = try load(std.testing.allocator, path);
+    defer loaded.deinit();
+    try std.testing.expectEqualStrings("sam", loaded.value.site.username);
+    try std.testing.expectEqual(@as(usize, 1), loaded.value.repos.len);
 }

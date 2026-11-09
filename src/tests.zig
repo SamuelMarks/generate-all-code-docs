@@ -1,4 +1,7 @@
+//! Root test aggregator importing all `generate-all-code-docs` modules and running end-to-end integration checks.
+
 const std = @import("std");
+const types = @import("types.zig");
 const paths = @import("paths.zig");
 const source = @import("source.zig");
 const doc_tool = @import("doc_tool.zig");
@@ -14,35 +17,14 @@ const discover = @import("discover.zig");
 const index = @import("index.zig");
 const deploy = @import("deploy.zig");
 const inject = @import("inject.zig");
+const main_mod = @import("main.zig");
 
-// Aggregated tests for shared helpers.
-test "output path joins" {
-    // covers: paths.outputPath
-    const allocator = std.testing.allocator;
-    const out = try paths.outputPath(allocator, "site", "docs", "repo");
-    defer allocator.free(out);
-    try std.testing.expect(std.mem.endsWith(u8, out, "site/docs/repo") or std.mem.endsWith(u8, out, "site\\docs\\repo"));
-}
-
-// Ensure source parsing matches expectations.
-test "source detection" {
-    try std.testing.expectEqual(source.SourceKind.archive_url, source.parse("https://x/y.zip").kind);
-}
-
-// Ensure file utils detect existing files.
-test "file exists detects" {
-    // covers: fsutils.fileExists
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "file.txt", .data = "ok" });
-    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "file.txt");
-    defer std.testing.allocator.free(path);
-    try std.testing.expect(fsutils.fileExists(path));
-}
-
-// Import modules to ensure their tests are included.
 comptime {
+    _ = types;
+    _ = paths;
+    _ = source;
     _ = doc_tool;
+    _ = fsutils;
     _ = archive;
     _ = config;
     _ = git;
@@ -54,4 +36,40 @@ comptime {
     _ = index;
     _ = deploy;
     _ = inject;
+    _ = main_mod;
+}
+
+test "end-to-end discover -> run -> list -> clean workflow" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(base);
+
+    try tmp.dir.createDirPath(std.testing.io, "workspace/alpha/.git");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/alpha/mkdocs.yml", .data = "site_name: alpha\x0a" });
+
+    const ws_root = try std.Io.Dir.path.join(std.testing.allocator, &.{ base, "workspace" });
+    defer std.testing.allocator.free(ws_root);
+    const cfg_path = try std.Io.Dir.path.join(std.testing.allocator, &.{ base, "generate-all-code-docs.json" });
+    defer std.testing.allocator.free(cfg_path);
+    const out_dir = try std.Io.Dir.path.join(std.testing.allocator, &.{ base, "site" });
+    defer std.testing.allocator.free(out_dir);
+
+    var out_buf: [4096]u8 = undefined;
+    var err_buf: [1024]u8 = undefined;
+    var out_writer = std.Io.Writer.fixed(&out_buf);
+    var err_writer = std.Io.Writer.fixed(&err_buf);
+
+    try app.run(std.testing.allocator, .{
+        .mode = .discover,
+        .config_path = cfg_path,
+        .discover_root = ws_root,
+        .discover_absolute = true,
+        .init_username = "sam",
+        .init_path = "docs",
+        .init_output_dir = out_dir,
+    }, &out_writer, &err_writer);
+
+    try std.testing.expect(fsutils.fileExists(cfg_path));
 }
